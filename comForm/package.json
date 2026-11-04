@@ -1,0 +1,17 @@
+{
+  "name": "needmap-community-form",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test *.test.js",
+    "dev": "vite --host 127.0.0.1 --port 5173 --strictPort",
+    "build": "node build.mjs",
+    "preview": "vite preview --host 127.0.0.1 --port 4173 --strictPort"
+  },
+  "devDependencies": {
+    "acorn": "^8.19.0",
+    "terser": "^5.51.2",
+    "vite": "^8.3.5"
+  }
+}

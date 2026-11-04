@@ -1,0 +1,452 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import { context, read, plain, valid } from './test-helpers.js';
+const html = read('index.html');
+const i18nSource = read('i18n.js');
+const i18nKeys = Function('return [' + i18nSource.match(/var KEYS = \[([\s\S]*?)\n  \];/)[1] + ']')();
+const i18nEnglish = Function('return [' + i18nSource.match(/var ENGLISH = \[([\s\S]*?)\n  \];/)[1] + ']')();
+const english = Object.fromEntries(i18nKeys.map((key, index) => [key, i18nEnglish[index]]));
+function mount({ write = (_id, _report, done) => done(null), online = true, saved = null, storageFailure = false, geolocation = true, search, searchFactory, hints = {}, legacyPreference = null, performance, mapUrl = '/map/' } = {}) {
+  let focused, locationSuccess, locationFailure, timerId = 0, draft = saved, writes = 0;
+  const navigations = [];
+  const storageReads = [];
+  const timers = new Map();
+  class Element {
+    value = ''; textContent = ''; disabled = false; hidden = false; attributes = {}; children = []; listeners = {};
+    constructor(id = '') { this.id = id; }
+    get firstChild() { return this.children[0]; }
+    addEventListener(name, callback) { (this.listeners[name] ??= []).push(callback); }
+    dispatch(name, extra = {}) { const event = { prevented: false, preventDefault() { this.prevented = true; }, ...extra }; for (const cb of this.listeners[name] || []) cb(event); return event; }
+    setAttribute(key, value) { this.attributes[key] = value; }
+    getAttribute(key) { return this.attributes[key] || (key === 'data-search-url' ? 'https://places.test/search' : null); }
+    removeAttribute(key) { delete this.attributes[key]; }
+    appendChild(child) { this.children.push(child); }
+    removeChild(child) { this.children.splice(this.children.indexOf(child), 1); }
+    focus() { focused = this.id; }
+  }
+  const elements = Object.fromEntries([...html.matchAll(/id="([^"]+)"/g)].map(([, id]) => [id, new Element(id)]));
+  const form = elements['signal-form'];
+  form.setAttribute('data-map-url', mapUrl);
+  form.reset = () => { if (!form.dispatch('reset').prevented) ['category', 'severity', 'summary', 'place-query', 'latitude', 'longitude'].forEach(name => { elements[name].value = ''; }); };
+  elements['form-fields'].querySelectorAll = () => ['category', 'severity', 'summary', 'location-button', 'clear-location', 'place-query', 'place-search-button', 'latitude', 'longitude', 'coordinates-button', 'submit-button'].map(name => elements[name]);
+  const rootEvents = new Element('window');
+  const connection = new Element('connection');
+  const navigator = { onLine: online, ...hints };
+  if (hints.connection) navigator.connection = Object.assign(connection, hints.connection);
+  if (geolocation) navigator.geolocation = { getCurrentPosition(success, error) { locationSuccess = success; locationFailure = error; } };
+  const body = new Element('body');
+  const ctx = context({ document: { body, getElementById: id => elements[id], createElement: () => new Element() }, navigator, performance, XMLHttpRequest: function () {},
+    location: { hostname: '127.0.0.1', host: '127.0.0.1:5173', port: '5173', protocol: 'http:', assign(url) { navigations.push(url); } },
+    localStorage: { getItem(key) { storageReads.push(key); if (storageFailure) throw new Error('blocked'); return key === 'needmap-connection-mode-v1' ? legacyPreference : draft; }, setItem(key, value) { if (key !== 'needmap-connection-mode-v1') draft = value; }, removeItem(key) { if (key !== 'needmap-connection-mode-v1') draft = null; } },
+    addEventListener: rootEvents.addEventListener.bind(rootEvents), setTimeout: (callback, delay) => { timers.set(++timerId, { callback, delay }); return timerId; }, clearTimeout: id => timers.delete(id) });
+  let language = 'en', overrides = {};
+  ctx.NeedMapI18n = { t(key, parameters) { let value = overrides[key] || english[key] || key; return value.replace(/\{(\w+)\}/g, (_match, name) => parameters?.[name] ?? ''); }, getLanguage() { return language; } };
+  ctx.NeedMapNetwork.createClient = () => ({ writeReport: (id, report, done) => { writes++; write(id, plain(report), done); } });
+  if (search) ctx.NeedMapNetwork.request = search;
+  if (searchFactory) ctx.NeedMapPlaceSearch = searchFactory;
+  vm.runInContext(read('app.js'), ctx);
+  return { elements, form, navigator, body, connection, navigations, window: rootEvents, loading: ctx.NeedMapLoading,
+    storageReads, get focused() { return focused; }, get writes() { return writes; }, get saved() { return draft; },
+    locate: () => locationSuccess({ coords: valid.location }), rejectLocation: (code = 1) => locationFailure({ code }),
+    changeLanguage(code, messages) { language = code; overrides = messages; rootEvents.dispatch('needmap-languagechange'); },
+    slow() { for (const timer of timers.values()) if (timer.delay === 8000 || timer.delay === 15000) timer.callback(); },
+    fill({ addLocation = true } = {}) { for (const name of ['category', 'severity', 'summary']) elements[name].value = valid[name]; if (addLocation) { elements['location-button'].dispatch('click'); locationSuccess({ coords: valid.location }); } } };
+}
+
+test('coordinate fields are labelled and scripts stay local; submit requires successful initialization', () => {
+  assert.doesNotMatch(html, /type="module"|https:[^"']+\.js/);
+  for (const name of ['latitude', 'longitude']) {
+    assert.match(html, new RegExp('<label for="' + name + '"'));
+    assert.match(html, new RegExp('id="' + name + '"[^>]*aria-describedby="[^"]*' + name + '-error'));
+  }
+  assert.doesNotMatch(html, /id="(?:connection-mode|mode-status|mode-preference-note|mode-label)"/);
+  assert.doesNotMatch(html, /class="demo-banner"|data-i18n="demoBanner"|Connection mode|Slow connection mode/);
+  assert.match(html, /id="language-button"[^>]+aria-controls="language-panel"[^>]*>[\s\S]*?<span id="language-button-label">English<\/span>[\s\S]*?class="language-chevron"/);
+  assert.match(html, /<label for="language-search" data-i18n="languageSearch">Search languages<\/label>/);
+  assert.match(html, /id="submit-button"[^>]+disabled/);
+  assert.match(html, /role="progressbar"(?![^>]*aria-valuenow)/);
+  assert.match(html, /<noscript><style>#loading-status \{ display: none !important; \}<\/style><\/noscript>/);
+  assert.doesNotMatch(html, /global-loading|position:\s*fixed/);
+  assert.match(html, /id="form-loading-label"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(html, /id="language-loading-label"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(html, /id="location-loading"[^>]*role="progressbar"[^>]*aria-labelledby="location-status"/);
+  assert.match(html, /id="search-loading"[^>]*role="progressbar"[^>]*aria-labelledby="place-search-status"/);
+  assert.match(html, /id="submission-loading"[^>]*role="progressbar"[^>]*aria-labelledby="form-status"/);
+  assert.doesNotMatch(html, /role="progressbar"[^>]*(?:aria-valuetext|aria-valuenow)/);
+  assert.ok(html.indexOf('src=".\/loading-bar.js"') < html.indexOf('src=".\/i18n.js"'));
+});
+
+test('loading state covers real asynchronous location, search, and submission work', () => {
+  let searchDone, submitDone;
+  const page = mount({
+    search: (_method, _url, _body, _token, done) => { searchDone = done; },
+    write: (_id, _report, done) => { submitDone = done; }
+  });
+  assert.equal(page.loading.isActive(), false);
+  page.elements['location-button'].dispatch('click');
+  assert.equal(page.loading.isActive('location'), true);
+  assert.equal(page.elements['location-loading'].hidden, false);
+  assert.equal(page.elements['location-loading-area'].attributes['aria-busy'], 'true');
+  assert.equal(page.elements['location-status'].attributes['aria-busy'], undefined);
+  assert.equal(page.elements['search-loading'].hidden, true);
+  page.elements['clear-location'].dispatch('click');
+  assert.equal(page.loading.isActive('location'), false);
+  assert.equal(page.elements['location-loading'].hidden, true);
+  page.elements['place-query'].value = 'Example town';
+  page.elements['place-search-button'].dispatch('click');
+  assert.equal(page.loading.isActive('place-search'), true);
+  assert.equal(page.elements['search-loading'].hidden, false);
+  assert.equal(page.elements['search-loading-area'].attributes['aria-busy'], 'true');
+  assert.equal(page.elements['place-search-status'].attributes['aria-busy'], undefined);
+  searchDone(new Error('offline'));
+  assert.equal(page.loading.isActive('place-search'), false);
+  page.fill();
+  page.form.dispatch('submit');
+  assert.equal(page.loading.isActive('submission'), true);
+  assert.equal(page.elements['submission-loading'].hidden, false);
+  assert.equal(page.elements['submission-loading-area'].attributes['aria-busy'], 'true');
+  assert.equal(page.elements['form-status'].attributes['aria-busy'], undefined);
+  submitDone(new Error('unconfirmed'));
+  assert.equal(page.loading.isActive(), false);
+  assert.equal(page.elements['submission-loading'].hidden, true);
+  assert.equal(page.elements['submission-loading-area'].attributes['aria-busy'], undefined);
+});
+
+test('validation and offline checks never start the loading bar, and cancellation ignores stale results', () => {
+  let searchDone;
+  const invalid = mount();
+  invalid.form.dispatch('submit');
+  assert.equal(invalid.loading.isActive(), false);
+  const offline = mount({ online: false });
+  offline.fill();
+  offline.form.dispatch('submit');
+  assert.equal(offline.loading.isActive(), false);
+  const pending = mount({ search: (_method, _url, _body, _token, done) => { searchDone = done; } });
+  pending.elements['place-query'].value = 'Example town';
+  pending.elements['place-search-button'].dispatch('click');
+  pending.form.reset();
+  assert.equal(pending.loading.isActive(), false);
+  searchDone(null, [{ lat: '40', lon: '-70', display_name: 'Example town' }]);
+  assert.equal(pending.loading.isActive(), false);
+});
+
+test('a late cancelled search cannot hide the loading bar for its replacement', () => {
+  const callbacks = [];
+  const page = mount({ searchFactory: () => (_query, callback) => { callbacks.push(callback); } });
+  page.elements['place-query'].value = 'First town';
+  page.elements['place-search-button'].dispatch('click');
+  page.elements['place-query'].dispatch('input');
+  page.elements['place-query'].value = 'Second town';
+  page.elements['place-search-button'].dispatch('click');
+  assert.equal(page.loading.isActive('place-search'), true);
+  callbacks[0](null, []);
+  assert.equal(page.loading.isActive('place-search'), true);
+  callbacks[1](null, []);
+  assert.equal(page.loading.isActive('place-search'), false);
+});
+test('invalid submissions focus a linked error summary without writes', () => {
+  const page = mount(); page.form.dispatch('submit');
+  assert.equal(page.writes, 0); assert.equal(page.focused, 'error-summary');
+  assert.equal(page.elements['error-list'].children.length, 4);
+});
+test('device location is permission-driven, immediately rounded and clear invalidates stale callbacks', () => {
+  const page = mount(); assert.equal(page.saved, null); page.fill();
+  assert.equal(JSON.parse(page.saved).location.latitude, 37.773); assert.doesNotMatch(page.saved, /37\.77491234/);
+  page.elements['location-button'].dispatch('click'); page.elements['clear-location'].dispatch('click'); page.locate();
+  assert.equal(JSON.parse(page.saved).location, null);
+});
+test('denied or unavailable device location offers search next steps', () => {
+  const page = mount(); page.elements['location-button'].dispatch('click'); page.rejectLocation();
+  assert.match(page.elements['location-status'].textContent, /denied.*search/); assert.equal(page.elements['location-button'].disabled, false);
+  const unavailable = mount({ geolocation: false }); unavailable.elements['location-button'].dispatch('click');
+  assert.match(unavailable.elements['location-status'].textContent, /unavailable.*Search/);
+});
+test('reset invalidates outstanding location and search responses', () => {
+  let done; const page = mount({ search: (_m, _u, _b, _t, cb) => { done = cb; } });
+  page.elements['place-query'].value = 'Example town'; page.elements['place-search-button'].dispatch('click'); page.form.reset();
+  done(null, [{ lat: '40', lon: '-70', display_name: 'Example town' }]); assert.equal(page.elements['place-results'].children.length, 0);
+  page.elements['location-button'].dispatch('click'); page.form.reset(); page.locate(); assert.equal(page.saved, null);
+});
+test('place search requires selection and omits query and precise coordinates from draft/report', () => {
+  let payload; const page = mount({ write: (_id, report, done) => { payload = report; done(null); }, search: (_m, _u, _b, _t, done) => done(null, [{ lat: '40.123456', lon: '-70.234567', display_name: 'Example town' }]) });
+  page.fill({ addLocation: false }); page.elements['location-button'].dispatch('click'); page.elements['place-query'].value = 'Example town'; page.elements['place-search-button'].dispatch('click');
+  page.form.dispatch('submit'); assert.equal(page.writes, 0);
+  page.elements['place-results'].children[0].children[0].dispatch('click'); page.locate();
+  assert.doesNotMatch(page.saved, /Example town|40\.123456/); page.form.dispatch('submit'); assert.equal(payload.latitude, 40.122);
+});
+
+function enterCoordinates(page, latitude, longitude) {
+  for (const [name, value] of Object.entries({ latitude, longitude })) {
+    page.elements[name].value = value;
+    page.elements[name].dispatch('input');
+  }
+}
+
+test('pasted coordinates work without device location and store only the rounded area', () => {
+  let payload;
+  const page = mount({ geolocation: false, write: (_id, report, done) => { payload = report; done(null); } });
+  page.fill({ addLocation: false });
+  enterCoordinates(page, ' 40.1234567 ', '-70.2345678');
+  assert.equal(JSON.parse(page.saved).location, null);
+  assert.doesNotMatch(page.saved, /40\.1234567|70\.2345678/);
+  page.elements['coordinates-button'].dispatch('click');
+  const draft = JSON.parse(page.saved);
+  assert.equal(draft.location.latitude, 40.122);
+  assert.equal(draft.location.longitude, -70.236);
+  assert.equal(draft.location.locationPrecision, 'approximate_grid_500m');
+  assert.doesNotMatch(page.saved, /40\.1234567|70\.2345678/);
+  assert.match(page.elements['location-status'].textContent, /coordinates.*approximate/);
+  const restored = mount({ saved: page.saved });
+  assert.equal(restored.elements.latitude.value, '');
+  assert.equal(restored.elements.longitude.value, '');
+  page.form.dispatch('submit');
+  assert.equal(payload.latitude, 40.122);
+  assert.equal(payload.longitude, -70.236);
+  assert.doesNotMatch(JSON.stringify(payload), /40\.1234567|70\.2345678/);
+  assert.equal(page.saved, null);
+});
+
+test('invalid coordinate replacements cannot silently submit an older selected location', () => {
+  for (const [latitude, longitude, invalid] of [['', '0', 'latitude'], ['91', '0', 'latitude'], ['0', '-181', 'longitude'], ['12north', '0', 'latitude']]) {
+    const page = mount();
+    page.fill();
+    enterCoordinates(page, latitude, longitude);
+    assert.equal(JSON.parse(page.saved).location, null);
+    page.elements['coordinates-button'].dispatch('click');
+    assert.equal(page.elements[invalid].attributes['aria-invalid'], 'true');
+    assert.ok(page.elements[invalid + '-error'].textContent);
+    page.form.dispatch('submit');
+    assert.equal(page.writes, 0);
+    assert.equal(page.elements['error-summary'].hidden, false);
+    assert.equal(JSON.parse(page.saved).location, null);
+  }
+});
+
+test('submitting applies newly entered or edited coordinates without a separate confirmation click', () => {
+  for (const previouslySelected of [false, true]) {
+    let payload;
+    const page = mount({ write: (_id, report, done) => { payload = report; done(null); } });
+    page.fill({ addLocation: previouslySelected });
+    enterCoordinates(page, '0', '0');
+    page.form.dispatch('submit');
+    assert.equal(page.writes, 1);
+    assert.equal(payload.latitude, 0);
+    assert.equal(payload.longitude, 0);
+  }
+});
+
+test('manual coordinate selection supersedes pending device and place-search callbacks', () => {
+  let searchDone;
+  const page = mount({ search: (_method, _url, _body, _token, done) => { searchDone = done; } });
+  page.elements['location-button'].dispatch('click');
+  enterCoordinates(page, '0', '0');
+  page.elements['coordinates-button'].dispatch('click');
+  page.locate();
+  assert.equal(JSON.parse(page.saved).location.latitude, 0);
+  assert.equal(page.loading.isActive('location'), false);
+  page.elements['place-query'].value = 'Example town';
+  page.elements['place-search-button'].dispatch('click');
+  enterCoordinates(page, '10', '20');
+  page.elements['coordinates-button'].dispatch('click');
+  const selected = JSON.parse(page.saved).location;
+  searchDone(null, [{ lat: '40', lon: '-70', display_name: 'Example town' }]);
+  assert.deepEqual(JSON.parse(page.saved).location, selected);
+  assert.equal(page.elements['place-results'].children.length, 0);
+  assert.equal(page.loading.isActive('place-search'), false);
+});
+
+test('clear location and form reset remove manual entries and validation errors', () => {
+  for (const resetForm of [false, true]) {
+    const page = mount();
+    enterCoordinates(page, '91', '-181');
+    page.elements['coordinates-button'].dispatch('click');
+    if (resetForm) page.form.reset();
+    else page.elements['clear-location'].dispatch('click');
+    for (const name of ['latitude', 'longitude']) {
+      assert.equal(page.elements[name].value, '');
+      assert.equal(page.elements[name].attributes['aria-invalid'], undefined);
+      assert.equal(page.elements[name + '-error'].textContent, '');
+    }
+    assert.equal(page.elements['error-summary'].hidden, true);
+    assert.equal(page.elements['error-list'].children.length, 0);
+    assert.equal(resetForm ? page.saved : JSON.parse(page.saved).location, null);
+  }
+});
+
+test('clearing coordinate errors preserves unrelated form errors and their summary links', () => {
+  const page = mount();
+  enterCoordinates(page, '91', '-181');
+  page.form.dispatch('submit');
+  assert.equal(page.elements['error-list'].children.length, 5);
+  page.elements['clear-location'].dispatch('click');
+  assert.equal(page.elements['error-summary'].hidden, false);
+  assert.deepEqual(page.elements['error-list'].children.map(item => item.children[0].href), ['#category', '#summary', '#severity']);
+  for (const name of ['category', 'summary', 'severity']) {
+    assert.equal(page.elements[name].attributes['aria-invalid'], 'true');
+    assert.ok(page.elements[name + '-error'].textContent);
+  }
+  for (const name of ['latitude', 'longitude']) {
+    assert.equal(page.elements[name].attributes['aria-invalid'], undefined);
+    assert.equal(page.elements[name + '-error'].textContent, '');
+  }
+});
+
+test('switching to device or selected place location discards pending coordinate edits', () => {
+  const page = mount({ search: (_m, _u, _b, _t, done) => done(null, [{ lat: '40.123456', lon: '-70.234567', display_name: 'Example town' }]) });
+  enterCoordinates(page, '91', '0');
+  page.elements['location-button'].dispatch('click');
+  assert.equal(page.elements.latitude.value, '');
+  assert.equal(page.elements.longitude.value, '');
+  page.locate();
+  assert.equal(JSON.parse(page.saved).location.latitude, 37.773);
+  enterCoordinates(page, '91', '0');
+  page.elements['place-query'].value = 'Example town';
+  page.elements['place-search-button'].dispatch('click');
+  page.elements['place-results'].children[0].children[0].dispatch('click');
+  assert.equal(page.elements.latitude.value, '');
+  assert.equal(page.elements.longitude.value, '');
+  page.fill({ addLocation: false });
+  page.form.dispatch('submit');
+  assert.equal(page.writes, 1);
+});
+
+test('Enter selects coordinates and pending submissions lock the new controls', () => {
+  let finish;
+  const page = mount({ write: (_id, _report, done) => { finish = done; } });
+  page.fill({ addLocation: false });
+  enterCoordinates(page, '0', '0');
+  assert.equal(page.elements.longitude.dispatch('keydown', { key: 'Enter' }).prevented, true);
+  assert.equal(page.writes, 0);
+  assert.equal(JSON.parse(page.saved).location.longitude, 0);
+  page.form.dispatch('submit');
+  for (const name of ['latitude', 'longitude', 'coordinates-button']) assert.equal(page.elements[name].disabled, true);
+  page.elements['coordinates-button'].dispatch('click');
+  assert.equal(page.writes, 1);
+  finish(new Error('unconfirmed'));
+  for (const name of ['latitude', 'longitude', 'coordinates-button']) assert.equal(page.elements[name].disabled, false);
+});
+
+test('coordinate errors and selected-location status update with the chosen language', () => {
+  const page = mount();
+  enterCoordinates(page, '91', '-181');
+  page.elements['coordinates-button'].dispatch('click');
+  page.changeLanguage('fr', { errorLatitude: 'Latitude invalide.', errorLongitude: 'Longitude invalide.' });
+  assert.equal(page.elements['latitude-error'].textContent, 'Latitude invalide.');
+  assert.equal(page.elements['longitude-error'].textContent, 'Longitude invalide.');
+  enterCoordinates(page, '0', '0');
+  page.elements['coordinates-button'].dispatch('click');
+  page.changeLanguage('fr', { coordinatesReady: 'Zone approximative prête.', locationSharedSuffix: 'Zone partagée uniquement.' });
+  assert.equal(page.elements['location-status'].textContent, 'Zone approximative prête. Zone partagée uniquement.');
+});
+
+test('pending submissions block resets and duplicate sends; confirmation clears draft', () => {
+  let finish; const page = mount({ write: (_id, _report, cb) => { finish = cb; } });
+  page.fill(); page.form.dispatch('submit'); page.form.dispatch('submit'); page.form.reset();
+  assert.equal(page.elements['form-fields'].disabled, true); assert.equal(page.elements.summary.value, valid.summary); assert.equal(page.writes, 1);
+  assert.ok(JSON.parse(page.saved).attempt.id); page.slow(); assert.match(page.elements['form-status'].textContent, /Still waiting/);
+  finish(null); assert.equal(page.saved, null); assert.equal(page.elements.summary.value, ''); assert.match(page.elements['form-status'].textContent, /Report received/);
+});
+test('lost acknowledgement survives reload with same reference and never automatically sends', () => {
+  let firstId; const first = mount({ write: (id, _report, done) => { firstId = id; done(new Error('timeout')); } });
+  first.fill(); first.form.dispatch('submit'); assert.match(first.elements['form-status'].textContent, /could not be confirmed/);
+  const second = mount({ saved: first.saved, write: (id, _report, done) => { assert.equal(id, firstId); done(null); } });
+  assert.equal(second.writes, 0); assert.equal(second.elements.summary.value, valid.summary); second.form.dispatch('submit'); assert.equal(second.writes, 1); assert.equal(second.saved, null);
+});
+test('offline draft can be written but reconnect never auto-sends', () => {
+  const page = mount({ online: false }); page.fill(); page.form.dispatch('submit');
+  assert.equal(page.writes, 0); assert.match(page.elements['form-status'].textContent, /offline/); assert.ok(page.saved);
+  page.navigator.onLine = true; page.window.dispatch('online'); assert.equal(page.writes, 0); assert.equal(page.elements['connection-status'].hidden, true);
+});
+test('restricted storage and corrupt or expired drafts do not break form use', () => {
+  const blocked = mount({ storageFailure: true }); blocked.fill(); assert.match(blocked.elements['draft-status'].textContent, /Saving on this phone is unavailable/); blocked.form.dispatch('submit'); assert.equal(blocked.writes, 1);
+  for (const saved of ['broken JSON', JSON.stringify({ savedAt: 1, summary: 'Expired draft' })]) { const page = mount({ saved }); assert.equal(page.elements.summary.value, ''); assert.equal(page.elements['submit-button'].disabled, false); }
+});
+
+test('failed replacement location never silently submits a previously selected area', () => {
+  const page = mount(); page.fill();
+  page.elements['location-button'].dispatch('click'); page.rejectLocation();
+  assert.equal(JSON.parse(page.saved).location, null);
+  page.form.dispatch('submit'); assert.equal(page.writes, 0);
+  assert.match(page.elements['location-error'].textContent, /Add your approximate location/);
+});
+
+test('fast and unsupported-browser conditions navigate only after confirmed success', () => {
+  for (const hints of [{}, { connection: { effectiveType: '4g', downlink: 20, rtt: 50 }, deviceMemory: 8 }]) {
+    let finish;
+    const page = mount({ hints, write: (_id, _report, done) => { finish = done; } });
+    page.fill(); page.form.dispatch('submit');
+    assert.deepEqual(page.navigations, []);
+    finish(null);
+    assert.deepEqual(page.navigations, ['http://127.0.0.1:5174/?lang=en']);
+    assert.equal(page.saved, null);
+    assert.equal(page.elements['map-link-container'].hidden, false);
+  }
+});
+
+test('automatic slow mode keeps every field usable and remains after confirmed submission', () => {
+  for (const hints of [{ connection: { effectiveType: '3g' } }, { connection: { saveData: true } }, { hardwareConcurrency: 2 }, { deviceMemory: 1 }]) {
+    const page = mount({ hints }); page.fill();
+    assert.equal(page.body.getAttribute('data-connection-mode'), 'slow');
+    page.form.dispatch('submit');
+    assert.equal(page.writes, 1); assert.deepEqual(page.navigations, []); assert.equal(page.saved, null);
+    assert.match(page.elements['form-status'].textContent, /Report received.*stay here/);
+    assert.equal(page.elements['map-link-container'].hidden, false);
+    assert.equal(page.elements['map-link'].href, 'http://127.0.0.1:5174/?lang=en');
+  }
+});
+
+test('legacy saved manual preference is ignored so current conditions decide automatically', () => {
+  const page = mount({ legacyPreference: 'slow', hints: { connection: { effectiveType: '4g', downlink: 20, rtt: 50 }, deviceMemory: 8 } });
+  assert.equal(page.body.getAttribute('data-connection-mode'), 'full');
+  assert.equal(page.storageReads.includes('needmap-connection-mode-v1'), false);
+  page.fill(); page.form.dispatch('submit');
+  assert.deepEqual(page.navigations, ['http://127.0.0.1:5174/?lang=en']);
+});
+
+test('degrading conditions and slow confirmation during a send prevent navigation', () => {
+  for (const degrade of [
+    page => { page.navigator.connection.effectiveType = '2g'; page.connection.dispatch('change'); page.navigator.connection.effectiveType = '4g'; page.connection.dispatch('change'); },
+    page => page.slow()
+  ]) {
+    let finish;
+    const page = mount({ hints: { connection: { effectiveType: '4g' } }, write: (_id, _report, done) => { finish = done; } });
+    page.fill(); page.form.dispatch('submit'); degrade(page); finish(null);
+    assert.deepEqual(page.navigations, []); assert.match(page.elements['form-status'].textContent, /Report received.*stay here/);
+  }
+});
+
+test('a report begun in slow mode never redirects when conditions improve during its send', () => {
+  let finish;
+  const page = mount({ hints: { connection: { effectiveType: '2g' } }, write: (_id, _report, done) => { finish = done; } });
+  page.fill(); page.form.dispatch('submit');
+  page.navigator.connection.effectiveType = '4g'; page.connection.dispatch('change'); finish(null);
+  assert.deepEqual(page.navigations, []);
+});
+
+test('failed or offline submissions never navigate or expose a submitted-report map link', () => {
+  for (const options of [{ online: false }, { write: (_id, _report, done) => done(new Error('unconfirmed')) }]) {
+    const page = mount(options); page.fill(); page.form.dispatch('submit');
+    assert.deepEqual(page.navigations, []); assert.equal(page.elements['map-link-container'].hidden, true); assert.ok(page.saved);
+  }
+});
+
+test('configured production map destination is used by both automatic and explicit navigation', () => {
+  const page = mount({ mapUrl: 'https://map.needmap.example/' }); page.fill(); page.form.dispatch('submit');
+  assert.deepEqual(page.navigations, ['https://map.needmap.example/?lang=en']);
+  assert.equal(page.elements['map-link'].href, 'https://map.needmap.example/?lang=en');
+  assert.doesNotMatch(html, /rel="(?:preload|prefetch|preconnect)"/);
+});
+
+test('a language change rerenders dynamic errors and status without changing community input', () => {
+  const page = mount();
+  page.elements.summary.value = 'Resident text stays exactly as entered.';
+  page.form.dispatch('submit');
+  page.changeLanguage('es', {
+    errorCategory: 'Elige una categoría de servicio.', errorSeverity: 'Elige un nivel de urgencia.',
+    errorLocation: 'Añade una ubicación aproximada.', submitReport: 'Enviar informe', useLocation: 'Usar mi ubicación', findPlace: 'Buscar lugar'
+  });
+  assert.equal(page.elements['category-error'].textContent, 'Elige una categoría de servicio.');
+  assert.equal(page.elements.summary.value, 'Resident text stays exactly as entered.');
+  assert.equal(page.elements['map-link'].href, 'http://127.0.0.1:5174/?lang=es');
+});
